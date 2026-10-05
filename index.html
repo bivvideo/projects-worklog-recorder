@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#2d333a">
+  <title>Worklog Voice</title>
+  <style>
+    *{box-sizing:border-box}
+    :root{--bg:#f2f4f6;--card:#fff;--graphite:#2d333a;--line:#d8dde2;--text:#30363d;--muted:#7e8791;--accent:#2b66bd;--red:#d74242}
+    body{margin:0;background:var(--bg);color:var(--text);font-family:Arial,Helvetica,sans-serif}
+    .wrap{min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:18px}
+    .card{width:min(760px,100%);background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:0 18px 55px rgba(0,0,0,.17);overflow:hidden}
+    .head{background:var(--graphite);color:#fff;padding:15px 17px}
+    .title{font-size:18px;font-weight:850}
+    .sub{font-size:12px;color:#bcc4cc;margin-top:4px;line-height:1.4}
+    .body{padding:16px}
+    .person{display:none;margin-bottom:10px;font-size:12px;color:#68717b}
+    .person strong{color:#333a42}
+    .state{display:flex;align-items:center;gap:8px;font-size:13px;color:#737b84;margin-bottom:10px}
+    .dot{width:9px;height:9px;border-radius:50%;background:#aab1b8}
+    .state.rec{color:#b42f2f;font-weight:800}.state.rec .dot{background:var(--red)}
+    textarea{width:100%;min-height:260px;border:1px solid #d5dae0;border-radius:10px;padding:12px 13px;font:15px/1.5 Arial,Helvetica,sans-serif;resize:vertical;outline:none}
+    textarea:focus{border-color:#9da9b6;box-shadow:0 0 0 3px rgba(55,96,150,.08)}
+    .hint{font-size:11px;line-height:1.45;color:#8a929b;margin-top:8px}
+    .error{color:#b52e2e}
+    .ok{color:#39754a}
+    .actions{display:flex;gap:9px;justify-content:flex-end;margin-top:13px;flex-wrap:wrap}
+    button{height:42px;border-radius:9px;padding:0 15px;font-size:14px;font-weight:800;cursor:pointer}
+    .secondary{border:1px solid #d5dae0;background:#fff;color:#525a63}
+    .record{border:0;background:var(--graphite);color:#fff}
+    .record.rec{background:var(--red)}
+    .send{border:0;background:var(--accent);color:#fff}
+    .send:disabled{opacity:.45;cursor:default}
+    .copy{display:none;border:1px solid #d5dae0;background:#fff;color:#525a63}
+    @media(max-width:560px){
+      .wrap{padding:0;align-items:flex-end}
+      .card{border-radius:16px 16px 0 0;min-height:82dvh}
+      .body{padding:14px}
+      textarea{min-height:330px}
+      .actions{display:grid;grid-template-columns:1fr 1fr}
+      .actions .send{grid-column:1/-1}
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <section class="card">
+    <div class="head">
+      <div class="title">Голосовой отчёт</div>
+      <div class="sub">RAW сохраняется без смысловой обработки. Можно оговариваться, исправляться и продолжать мысль.</div>
+    </div>
+    <div class="body">
+      <div id="person" class="person"></div>
+      <div id="state" class="state"><span class="dot"></span><span>Готов к записи</span></div>
+      <textarea id="text" placeholder="Нажмите «Начать» и говорите свободно…"></textarea>
+      <div id="hint" class="hint">После остановки нажмите «Готово — отправить RAW».</div>
+      <div class="actions">
+        <button id="clear" class="secondary" type="button">Очистить</button>
+        <button id="record" class="record" type="button">Начать</button>
+        <button id="copy" class="copy" type="button">Копировать текст</button>
+        <button id="send" class="send" type="button" disabled>Готово — отправить RAW</button>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const params = new URLSearchParams(location.search);
+  const token = params.get('token') || '';
+  const employee = params.get('employee') || '';
+  const Ctor = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+  let rec = null;
+  let recording = false;
+  let userStopped = false;
+  let baseText = '';
+  let finalText = '';
+  let restartTimer = null;
+
+  if (employee) {
+    $('person').style.display = 'block';
+    $('person').innerHTML = 'Сотрудник: <strong></strong>';
+    $('person').querySelector('strong').textContent = employee;
+  }
+
+  function setState(on, message) {
+    recording = !!on;
+    $('state').classList.toggle('rec', recording);
+    $('record').classList.toggle('rec', recording);
+    $('record').textContent = recording ? 'Остановить' : 'Начать';
+    $('state').querySelector('span:last-child').textContent =
+      message || (recording ? 'Запись… говорите' : 'Готов к записи');
+  }
+
+  function refreshSend() {
+    $('send').disabled = !$('text').value.trim();
+  }
+
+  function showError(message) {
+    $('hint').innerHTML = '<span class="error"></span>';
+    $('hint').querySelector('span').textContent = message;
+  }
+
+  function showHint(message, ok=false) {
+    $('hint').innerHTML = ok ? '<span class="ok"></span>' : '<span></span>';
+    $('hint').querySelector('span').textContent = message;
+  }
+
+  function startRecognition() {
+    if (!rec) {
+      $('text').focus();
+      showError('В этом браузере нет Web Speech API. Можно ввести текст вручную.');
+      return;
+    }
+    userStopped = false;
+    baseText = $('text').value.trim();
+    finalText = '';
+    setState(true, 'Запуск микрофона…');
+    try {
+      rec.start();
+    } catch (err) {
+      setState(false, 'Не удалось начать запись');
+      showError(String(err && err.message || err));
+    }
+  }
+
+  function stopRecognition() {
+    userStopped = true;
+    recording = false;
+    clearTimeout(restartTimer);
+    try { rec && rec.stop(); } catch (_) {}
+    setState(false, 'Запись остановлена');
+    showHint('Проверьте текст и нажмите «Готово — отправить RAW».');
+  }
+
+  if (!Ctor) {
+    showError('В этом браузере нет встроенного распознавания речи. Можно ввести текст вручную.');
+  } else {
+    rec = new Ctor();
+    rec.lang = 'ru-RU';
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.maxAlternatives = 1;
+
+    rec.onstart = () => {
+      setState(true, 'Запись… говорите');
+      showHint('Самоисправления сохраняются как часть RAW-текста.');
+    };
+
+    rec.onresult = e => {
+      let interim = '';
+      let add = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const t = (e.results[i][0] && e.results[i][0].transcript) || '';
+        if (e.results[i].isFinal) add += t + ' ';
+        else interim += t;
+      }
+      if (add) finalText += (finalText && !finalText.endsWith(' ') ? ' ' : '') + add;
+      $('text').value = [baseText, finalText.trim(), interim.trim()].filter(Boolean).join(' ');
+      $('text').scrollTop = $('text').scrollHeight;
+      refreshSend();
+    };
+
+    rec.onerror = e => {
+      const code = (e && e.error) || 'unknown';
+      const map = {
+        'not-allowed': 'Нет разрешения на микрофон. Разрешите микрофон для этого сайта.',
+        'service-not-allowed': 'Браузер запретил сервис распознавания речи.',
+        'audio-capture': 'Микрофон не найден или занят другим приложением.',
+        'network': 'Сервис распознавания речи сейчас недоступен по сети.',
+        'no-speech': 'Речь не обнаружена. Можно нажать «Начать» ещё раз.',
+        'aborted': 'Распознавание остановлено.'
+      };
+      if (code !== 'aborted' || !userStopped) showError(map[code] || ('Ошибка распознавания: ' + code));
+      if (code === 'not-allowed' || code === 'service-not-allowed' || code === 'audio-capture') {
+        userStopped = true;
+        recording = false;
+      }
+    };
+
+    rec.onend = () => {
+      if (recording && !userStopped) {
+        restartTimer = setTimeout(() => {
+          try { rec.start(); }
+          catch (_) {
+            recording = false;
+            setState(false, 'Запись остановлена');
+          }
+        }, 180);
+        return;
+      }
+      setState(false, userStopped ? 'Запись остановлена' : 'Готов к записи');
+    };
+  }
+
+  $('record').addEventListener('click', () => {
+    if (recording) stopRecognition();
+    else startRecognition();
+  });
+
+  $('clear').addEventListener('click', () => {
+    if (recording) stopRecognition();
+    baseText = '';
+    finalText = '';
+    $('text').value = '';
+    refreshSend();
+    setState(false, 'Готов к записи');
+    showHint('Текст очищен.');
+  });
+
+  $('text').addEventListener('input', refreshSend);
+
+  $('copy').addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText($('text').value);
+      showHint('Текст скопирован.', true);
+    } catch (_) {
+      $('text').select();
+      document.execCommand('copy');
+      showHint('Текст скопирован.', true);
+    }
+  });
+
+  $('send').addEventListener('click', () => {
+    const text = $('text').value.trim();
+    if (!text) return;
+    if (recording) stopRecognition();
+
+    if (window.opener && !window.opener.closed && token) {
+      window.opener.postMessage({
+        type: 'PROJECTS_RAW_VOICE_RESULT',
+        token,
+        text,
+        source: 'github-pages-mic',
+        submit: true
+      }, '*');
+      $('send').disabled = true;
+      setState(false, 'Передано в основную базу');
+      showHint('RAW передан. Это окно сейчас закроется.', true);
+      setTimeout(() => window.close(), 650);
+    } else {
+      $('copy').style.display = 'inline-block';
+      showError('Основная вкладка не найдена. Нажмите «Копировать текст» и вставьте его в окно RAW вручную.');
+    }
+  });
+
+  window.addEventListener('beforeunload', () => {
+    clearTimeout(restartTimer);
+    try { rec && rec.abort(); } catch (_) {}
+  });
+
+  refreshSend();
+})();
+</script>
+</body>
+</html>
